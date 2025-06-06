@@ -1,0 +1,401 @@
+module pcileech_bar_impl_xhci (
+    input               rst,
+    input               clk,
+    // incoming BAR writes:
+    input [31:0]        wr_addr,
+    input [3:0]         wr_be,
+    input [31:0]        wr_data,
+    input               wr_valid,
+    // incoming BAR reads:
+    input  [87:0]       rd_req_ctx,
+    input  [31:0]       rd_req_addr,
+    input               rd_req_valid,
+    // outgoing BAR read replies:
+    output bit [87:0]   rd_rsp_ctx,
+    output bit [31:0]   rd_rsp_data,
+    output bit          rd_rsp_valid,
+    
+    output reg          need_interrupt
+);
+
+    // Register pipeline for timing
+    bit [87:0]      drd_req_ctx;
+    bit [31:0]      drd_req_addr;
+    bit             drd_req_valid;
+    bit [31:0]      dwr_addr;
+    bit [31:0]      dwr_data;
+    bit             dwr_valid;
+
+    // MFINDEX counter implementation
+    // At 62.5MHz, need to count 7812.5 clocks for 125μs
+    // Using 13-bit counter: 0-7812
+    reg [12:0] mf_counter;
+    reg [13:0] mfindex;  // 14-bit microframe index
+
+    // Constants for MFINDEX timing
+    localparam MF_MAX_COUNT = 13'd7812;  // Count to achieve 125μs at 62.5MHz
+
+    // Map MFINDEX to 32-bit register format
+    wire [31:0] mfindex_reg = {18'h0, mfindex};
+
+    // Capability Registers (Read-only)
+    localparam CAPLENGTH = 8'h20;            // Operational registers start at offset 0x20
+    localparam HCIVERSION = 16'h0100;        // XHCI version 1.0
+    localparam HCSPARAMS1 = 32'h05000420;
+    localparam HCSPARAMS2 = 32'hFC000031; // 4 scratch pad buffers
+    localparam HCSPARAMS3 = 32'h00E70004; // No U1/U2 exit latency
+    localparam HCCPARAMS = 32'h002841EB;  // 64-bit addr, BW neg capable
+    localparam DBOFF = 32'h00000100;      // Doorbell array offset
+    localparam RTSOFF = 32'h00000200;     // Runtime register space offset
+
+    // Operating Registers
+    reg [31:0] usbcmd;          // USB Command Register (0x00)
+    reg [31:0] usbsts;          // USB Status Register (0x04)
+    reg [31:0] dnctrl;          // Device Notification Control (0x14)
+    reg [63:0] crcr;            // Command Ring Control Register (0x18)
+    reg [63:0] dcbaap;          // Device Context BAA Pointer (0x30)
+    reg [31:0] xconfig;          // Configure Register (0x38)
+    
+    // Port Registers
+    reg [31:0] portsc;          // Port Status and Control
+    reg [31:0] portpmsc;        // Port Power Management Status and Control
+    reg [31:0] portli;          // Port Link Info
+    
+    reg [31:0] portsc2;          // Port Status and Control
+    reg [31:0] portpmsc2;        // Port Power Management Status and Control
+    reg [31:0] portli2;          // Port Link Info
+    
+    // Doorbell Register (only slot 0 for command ring)
+    reg [31:0] doorbell;        // Slot 0 doorbell
+    
+    // Runtime Registers (only primary interrupter)
+    reg [31:0] iman;            // Interrupter Management
+    reg [31:0] imod;            // Interrupter Moderation
+    reg [31:0] erstsz;          // Event Ring Segment Table Size
+    reg [63:0] erstba;          // Event Ring Segment Table Base Address
+    reg [63:0] erdp;            // Event Ring Dequeue Pointer
+
+    // Internal state
+    reg running;                // Controller running state
+    reg cmd_ring_running;       // Command ring state
+    reg event_ring_ready;       // Event ring state
+    reg port_powered;           // Port power state
+
+    // Event generation logic
+    reg [3:0] event_pending;    // Types of pending events
+    reg [63:0] event_data;      // Data for pending event
+
+    wire [31:0] offset_rd_addr = {drd_req_addr[31:2], 2'b00} & 32'h0FFF;
+    wire [31:0] offset_wr_addr = dwr_addr[31:2], 2'b00 & 32'h0FFF;
+    
+    reg [30:0] interrupt_counter;
+    reg need_interrupt_d;
+    
+    reg [19:0] reset_counter;      // Counter for reset delay
+    reg [19:0] save_counter;       // Counter for save state delay
+    reg [19:0] restore_counter;    // Counter for restore state delay
+    reg [19:0] halt_counter;    // Counter for restore state delay
+    reg [19:0] run_counter;    // Counter for restore state delay
+    
+    // Constants for timing delays (at 62.5MHz)
+    localparam RESET_DELAY    = 20'd62500;   // 1ms delay for reset
+    localparam HALT_DELAY    = 20'd62500;   // 1ms delay for reset
+    localparam RUN_DELAY    = 20'd62500;   // 1ms delay for reset
+    localparam SAVE_DELAY     = 20'd31250;   // 500?s delay for save state
+    localparam RESTORE_DELAY  = 20'd31250;   // 500?s delay for restore state
+    
+    // State flags
+    reg reset_in_progress;
+    reg save_in_progress;
+    reg restore_in_progress;
+    reg halt_in_progress;
+    reg run_in_progress;
+
+    // Reset and main control logic
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            // Reset all registers to default values
+            usbcmd <= 32'h0;
+            usbsts <= 32'h0001;          // HCHalted = 1
+            dnctrl <= 32'h0;
+            crcr <= 64'h0;
+            dcbaap <= 64'h0;
+            xconfig <= 32'h0;
+
+            // Port registers
+            portsc <= 32'h0E0002A0;
+            portpmsc <= 32'h0;
+            portli <= 32'h0;
+
+            portsc2 <= 32'h0E0002A0;
+            portpmsc2 <= 32'h0;
+            portli2 <= 32'h0;
+
+            doorbell <= 32'h0;
+
+            // Runtime registers
+            iman <= 32'h0;
+            imod <= 32'h0;
+            erstsz <= 32'h0;
+            erstba <= 64'h0;
+            erdp <= 64'h0;
+            
+            // Internal state
+            running <= 1'b0;
+            cmd_ring_running <= 1'b0;
+            event_ring_ready <= 1'b0;
+            port_powered <= 1'b0;
+            event_pending <= 4'h0;
+
+            mf_counter <= 0;
+            mfindex <= 0;
+
+            interrupt_counter <= 0;
+            need_interrupt <= 0;
+            need_interrupt_d <= 0;
+
+            rd_rsp_valid <= 0;
+            
+            // Reset counters and state flags
+            reset_counter <= 20'h0;
+            save_counter <= 20'h0;
+            restore_counter <= 20'h0;
+            halt_counter <= 20'h0;
+            run_counter <= 20'h0;
+            reset_in_progress <= 1'b0;
+            save_in_progress <= 1'b0;
+            restore_in_progress <= 1'b0;
+            halt_in_progress <= 1'b0;
+            run_in_progress <= 1'b0;
+        end else begin
+            // Pipeline registers
+            drd_req_ctx <= rd_req_ctx;
+            drd_req_addr <= rd_req_addr;
+            drd_req_valid <= rd_req_valid;
+            rd_rsp_ctx <= drd_req_ctx;
+            rd_rsp_valid <= drd_req_valid;
+            dwr_addr <= wr_addr;
+            dwr_data <= wr_data;
+            dwr_valid <= wr_valid;
+
+            if (drd_req_valid) begin
+                case (offset_rd_addr)
+                    // Capability Registers
+                    32'h00: rd_rsp_data <= 32'h01000020;
+                    32'h04: rd_rsp_data <= HCSPARAMS1;
+                    32'h08: rd_rsp_data <= HCSPARAMS2;
+                    32'h0C: rd_rsp_data <= HCSPARAMS3;
+                    32'h10: rd_rsp_data <= HCCPARAMS;
+                    32'h14: rd_rsp_data <= DBOFF;
+                    32'h18: rd_rsp_data <= RTSOFF;
+
+                    // Operational Registers
+                    32'h20: rd_rsp_data <= usbcmd;
+                    32'h24: rd_rsp_data <= usbsts;
+                    32'h28: rd_rsp_data <= 32'h00000001; // PAGESIZE 4KB
+                    32'h34: rd_rsp_data <= dnctrl; // DNCTRL
+                    32'h38: rd_rsp_data <= crcr[31:0];
+                    32'h3C: rd_rsp_data <= crcr[63:32];
+                    32'h50: rd_rsp_data <= dcbaap[31:0];
+                    32'h54: rd_rsp_data <= dcbaap[63:32];
+                    32'h58: rd_rsp_data <= xconfig;
+                    
+                    // EXT CAPs
+                    32'hA0: rd_rsp_data <= 32'h00000401; // Next Ptr 0x04, CapId 0x01
+                    32'hA4: rd_rsp_data <= 32'h80010000; // USBLEGCTLSTS
+                    
+                    // USB 2.0 Protocl Info
+                    32'hB0: rd_rsp_data <= 32'h02000802;
+                    32'hB4: rd_rsp_data <= 32'h20425355;
+                    32'hB8: rd_rsp_data <= 32'h10060101;
+                    32'hBC: rd_rsp_data <= 32'h00000000;
+                    32'hC0: rd_rsp_data <= 32'h01E00023;
+                    
+                    // USB 3.0 Protocl Info
+                    32'hD0: rd_rsp_data <= 32'h03000002;
+                    32'hD4: rd_rsp_data <= 32'h20425355;
+                    32'hD8: rd_rsp_data <= 32'h10000402;
+                    32'hDC: rd_rsp_data <= 32'h00000000;
+                    32'hE0: rd_rsp_data <= 32'h00050134;
+                    
+                    32'h300: rd_rsp_data <= 32'h0001000A;
+                    
+                    // Port Registers
+                    32'h420: rd_rsp_data <= portsc;
+                    32'h424: rd_rsp_data <= portpmsc;
+                    32'h428: rd_rsp_data <= portli;
+                    32'h42C: rd_rsp_data <= 32'h00000000; // PORTHLPMC
+                    
+                    32'h430, 32'h440, 32'h450, 32'h460: rd_rsp_data <= portsc2;
+                    32'h434, 32'h444, 32'h454, 32'h464: rd_rsp_data <= portpmsc2;
+                    32'h438, 32'h448, 32'h458, 32'h468: rd_rsp_data <= portli2;
+                    32'h43C, 32'h44C, 32'h45C, 32'h46C: rd_rsp_data <= 32'h00000000; // PORTHLPMC
+
+                    
+                    // Doorbell Register
+                    32'h100: rd_rsp_data <= doorbell;
+
+                    // Runtime Registers
+                    32'h200: rd_rsp_data <= mfindex_reg;  // Return current MFINDEX value
+                    32'h220: rd_rsp_data <= iman;
+                    32'h224: rd_rsp_data <= imod;
+                    32'h228: rd_rsp_data <= erstsz;
+                    32'h22C: rd_rsp_data <= 32'h00000000; // Reserved
+                    32'h230: rd_rsp_data <= erstba[31:0];
+                    32'h234: rd_rsp_data <= erstba[63:32];
+                    32'h238: rd_rsp_data <= erdp[31:0];
+                    32'h23C: rd_rsp_data <= erdp[63:32];
+                    
+                    default: rd_rsp_data <= 32'h00000000;
+                endcase
+            end
+
+            // Handle register writes
+            else if (dwr_valid) begin
+                case (offset_wr_addr)
+                    // Operational Registers
+                    32'h20: begin  // USBCMD
+                        // Clear bits 9 and 8 while preserving other bits
+                        usbcmd <= dwr_data & ~(32'h300);  // Mask out bits [9:8]
+                        
+                        // Handle Reset
+                        if (dwr_data[1]) begin
+                            usbsts[11] <= 1'b1;  // Set CNR
+                        end
+                        
+                        if (!dwr_data[0] && usbcmd[0]) begin
+                            halt_in_progress <= 1'b1;
+                        end
+
+                        if (dwr_data[0] && !usbcmd[0]) begin
+                            run_in_progress <= 1'b1;
+                        end
+                    end
+
+                    32'h24: begin  // USBSTS (RW1C)
+                        usbsts <= usbsts & ~dwr_data[10:2]; // Only clear RW1C bits [10, 4, 3, 2]
+                    end
+                    
+                    32'h34: dnctrl <= dwr_data;
+                    
+                    32'h38: begin  // CRCR Low
+                        // RW bits
+                        crcr[31:6] <= dwr_data[31:6];
+                        crcr[0] <= dwr_data[0];
+                        // Command Stop
+                        // dwr_data[1]
+                        if (dwr_data[1] || dwr_data[2]) begin
+                            cmd_ring_running <= 1'b0;
+                        end
+                        // Command Abort
+                        // dwr_data[2]
+                        // Command Ring Running
+                        // RW1S
+                        if (dwr_data[3]) begin
+                            crcr[3] <= dwr_data[3];
+                            cmd_ring_running <= 1'b1;
+                        end
+                    end
+                    
+                    32'h3C: begin  // CRCR High
+                        crcr[63:32] <= dwr_data;
+                    end
+                    
+                    32'h50: dcbaap[31:0] <= dwr_data;   // DCBAAP Low
+                    32'h54: dcbaap[63:32] <= dwr_data;  // DCBAAP High
+                    32'h58: xconfig <= dwr_data;         // CONFIG
+                    
+                    // Port Registers
+                    32'h420: begin  // PORTSC
+                        // RW1CS bits - Write 1 to clear status
+                        portsc[22] <= portsc[22] & ~dwr_data[22];  // PLC
+                        portsc[21] <= portsc[21] & ~dwr_data[21];  // PRC
+                        portsc[20] <= portsc[20] & ~dwr_data[20];  // OCC
+                        portsc[18] <= portsc[18] & ~dwr_data[18];  // PEC
+                        portsc[17] <= portsc[17] & ~dwr_data[17];  // CSC
+                        portsc[1]  <= portsc[1]  & ~dwr_data[1];   // PED
+                    
+                        // RWS bits - Regular read/write status
+                        portsc[27] <= dwr_data[27];  // WOE
+                        portsc[26] <= dwr_data[26];  // WDE
+                        portsc[25] <= dwr_data[25];  // WCE
+                        portsc[16] <= dwr_data[16];  // LWS
+                        portsc[15:14] <= dwr_data[15:14];  // PIC
+                        portsc[9] <= dwr_data[9];    // PP
+                        portsc[8:5] <= dwr_data[8:5];  // PLS
+                    
+                        // RW1S bits - Write 1 to set
+                        portsc[4] <= portsc[4] | dwr_data[4];  // PR
+                    
+                        // Other bits remain unchanged:
+                        // Bit 30 (DR) - RO
+                        // Bits 13:10 (Port Speed) - ROS
+                        // Bit 3 (OCA) - RO
+                        // Bit 0 (CCS) - ROS
+                        
+                        // Bit 19 (RsvdP) - Preserved
+                        portsc[19] <= portsc[19];
+                    
+                        // RsvdZ bits are always 0
+                        portsc[31] <= 1'b0;
+                        portsc[29:28] <= 2'b0;
+                        portsc[24:23] <= 2'b0;
+                        portsc[2] <= 1'b0;
+                    
+                        if (dwr_data[9]) begin  // PP bit special handling
+                            port_powered <= 1'b1;
+                        end
+                    end
+                    
+                    32'h424: portpmsc <= dwr_data;  // PORTPMSC
+                    32'h428: portli <= dwr_data;    // PORTLI
+                    
+                    // Port Registers
+                    32'h430, 32'h440, 32'h450, 32'h460: begin  // PORTSC
+                        // Preserve RW1C bits
+                        portsc2 <= (portsc2 & ~32'h00FE0000) | (dwr_data & ~32'h00FE0000);
+                        if (dwr_data[9]) begin  // PP bit
+                            port_powered <= 1'b1;
+                        end
+                    end
+                    
+                    32'h434, 32'h444, 32'h454, 32'h464: portpmsc2 <= dwr_data;  // PORTPMSC
+                    32'h438, 32'h448, 32'h458, 32'h468: portli2 <= dwr_data;    // PORTLI
+                    
+                    // Doorbell Register (only slot 0)
+                    32'h100: begin  // Command Doorbell
+                        doorbell <= dwr_data;
+                        cmd_ring_running <= 1'b1;
+                        crcr[3] <= 1'b1;
+                    end
+
+                    // Runtime Registers
+                    32'h220: begin  // IMAN
+                        if (dwr_data[0]) begin  // Bit 0 is rw1c
+                            iman[0] <= 1'b0;
+                        end
+                        iman[31:1] <= dwr_data[31:1];
+                        if (dwr_data[1]) begin  // IE bit
+                            event_ring_ready <= 1'b1;
+                        end
+                    end
+                    32'h224: imod <= dwr_data;                // IMOD
+                    32'h228: erstsz <= dwr_data;              // ERSTSZ
+                    32'h230: begin  // ERSTBA Low
+                        erstba[31:0] <= dwr_data;        // ERSTBA Low
+                    end
+                    32'h234: begin
+                        erstba[63:32] <= dwr_data;       // ERSTBA High
+                    end
+                    32'h238: erdp[31:0] <= {dwr_data[31:4], erdp[3] & ~dwr_data[3], dwr_data[2:0]};
+                    32'h23C: erdp[63:32] <= dwr_data;         // ERDP High
+                    
+                    default: ; // No action for other addresses
+                endcase
+            end else begin
+                rd_rsp_data <= 32'h00000000;
+            end
+        end
+    end
+
+endmodule
